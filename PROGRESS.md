@@ -117,3 +117,17 @@ the hidden scorer. The earlier 6.959 s median is not a paired control.
 Reproduce the representation check with
 `python3.13 -m unittest discover -s tools -p test_static_map.py`.
 The local benchmark receipts are in `../work/lazy-map/results/`.
+
+## Guard unbounded edits
+
+Import-time structural edits cannot be bounded by adjacent executed lines.
+Even a literal replacement in a default expression can raise before the
+first test. Retain the entire suite for unrecognised definition changes or
+body code observed during collection. Do not intersect shared factory
+callers with users of the declaring class: the closure can escape.
+
+With the previous comparison profile still enabled, the public sample costs
+126.390 s, archived 748.585 s and held-out 157.001 s simulated, all zero
+misses. Compared with the indexed call-only version, those are increases
+of 5.342, 416.132 and 52.783 s. Many archived edits change dispatch-table
+keys during import. This is a correctness trade-off, not a speedup.

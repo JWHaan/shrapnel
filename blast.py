@@ -300,7 +300,7 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
     try:
         sc = Scopes(src)
     except SyntaxError:
-        imp.tests |= m.touch(fn)
+        imp.everything = True
         imp.notes.append(f"{fn}: unparsable pristine")
         return
     old_defs = new_defs = None
@@ -321,6 +321,7 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
             o = m.opened(fn)
             if o:
                 imp.tests |= {t for t in o if t >= 0}
+                imp.everything |= -1 in o
             return
         if only_file and len(d) == 1:
             single_change = d[0]
@@ -330,6 +331,13 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
                     imp.tests |= kept | {t for t in (m.opened(fn) or ()) if t >= 0}
                     imp.notes.append(f"{fn}: call evidence -> {len(kept)}")
                     return
+        # A literal inside an expression is not necessarily data: 1 / 1 can
+        # become 1 / 0 before any test runs. Compare the whole import-time tree.
+        if not (len(d) == 1 and _class_data_value(sc, *d[0][1:])):
+            if _ast_diffs(sc.tree, new_tree, skip_function_bodies=True):
+                imp.everything = True
+                imp.notes.append(f"{fn}: unrecognised definition-time edit")
+                return
         # A lone replaced expression cannot be in an unchanged enclosing
         # definition. Avoid dumping all the unrelated definitions in that file.
         anchor = d[0][1] if isinstance(d[0][1], ast.expr) else d[0][0]
@@ -368,6 +376,10 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
             lo, hi = sc.header_range(st)
             if not (lo <= ln <= hi):
                 lo, hi = ln, ln
+            if any(n in m.collect.get(fn, ()) for n in range(lo, hi + 1)):
+                imp.everything = True
+                imp.notes.append(f"{fn}:{ln} function ran during collection")
+                return
             got = m.tests_on(fn, lo, hi)
             if single_change is not None and got:
                 kept = _cmp_refine(fn, single_change, got, m)
@@ -420,6 +432,21 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
         imp.tests |= {t for t in o if t >= 0}
 
 
+def _class_data_value(sc, old, new):
+    if not (isinstance(old, ast.Constant) and isinstance(new, ast.Constant)
+            and type(old.value) is type(new.value)):
+        return False
+    node = old
+    parent = sc.parent.get(node)
+    if (isinstance(parent, ast.UnaryOp) and isinstance(parent.op, (ast.UAdd, ast.USub))
+            and type(old.value) in (int, float, complex)):
+        node, parent = parent, sc.parent.get(parent)
+    while isinstance(parent, (ast.List, ast.Tuple)) or isinstance(parent, ast.Dict) and node in parent.values:
+        node, parent = parent, sc.parent.get(parent)
+    return (isinstance(parent, ast.Assign) and parent.value is node and len(parent.targets) == 1
+            and isinstance(parent.targets[0], ast.Name) and isinstance(sc.parent.get(parent), ast.ClassDef))
+
+
 def _lambda_at(st: ast.AST, ln: int) -> ast.Lambda | None:
     """Innermost lambda in st whose body holds line ln (strictly below the lambda keyword)."""
     best = None
@@ -439,7 +466,6 @@ def _call_refine(fn, sc, change, m):
         return None
     calls = m.calls
     category, site, source = "calls", None, fn
-    candidates = None
     if isinstance(old, ast.Constant) and isinstance(new, ast.Constant):
         # At this pin, booleans in Expr.arg_types are only consumed by
         # __init_subclass__ -> required_args -> Expression.error_messages.
@@ -459,12 +485,8 @@ def _call_refine(fn, sc, change, m):
             if factory:
                 source = factory.rsplit(":", 1)[0]
                 site = factory
-                # Many declarations may use the same factory; retain its calls
-                # among the existing candidates for the declaring class.
-                cls = sc.cls[call.lineno]
-                if cls is None:
-                    return None
-                candidates = m.touch(fn) | _users_of(fn, sc, cls, m)
+                # A closure can escape the declaring class. A shared factory
+                # site cannot distinguish the individual returned instances.
     if site is None:
         # Limit this proof to changes that cannot affect closure binding or
         # turn an ordinary lambda into a generator (or vice versa).
@@ -488,19 +510,22 @@ def _call_refine(fn, sc, change, m):
             if "*" not in missing and key.value not in missing:
                 observed.remove(-1)
     extra = calls["inspected"]
-    unknown = set(calls["unknown"]) | set(extra.get("<child>", ()))
-    inspected = set(extra.get(module_name(source), ()))
+    unknown = set(calls["unknown"])
+    inspected = set(extra.get(module_name(source), ())) | set(extra.get(module_name(fn), ())) | set(extra.get("<child>", ()))
     if -1 in observed or -1 in unknown or -1 in inspected:
         return None  # collection may have propagated the value to any test
-    if candidates is not None:
-        observed &= candidates
-    elif unknown:
+    if unknown:
         # No call evidence for these tests: keep the original broader
         # file/class coverage, including a child interpreter's pristine lines.
         line = old.lineno if isinstance(old, ast.expr) else parent.lineno
         cls = sc.cls[line]
-        candidates = m.touch(fn) | (_users_of(fn, sc, cls, m) if cls else _module_users(fn, sc, m))
-    return observed | (unknown & candidates if unknown else set()) | inspected
+        if source != fn:
+            # An unprofiled consumer may call an exported closure without ever
+            # using the declaration's class, but still runs the factory's body.
+            unknown &= m.touch(source) | m.touch(fn) | _module_users(fn, sc, m)
+        else:
+            unknown &= m.touch(fn) | (_users_of(fn, sc, cls, m) if cls else _module_users(fn, sc, m))
+    return observed | unknown | inspected
 
 
 def _users_of(fn: str, sc: "Scopes", k: ast.AST, m: Map) -> set[int]:
@@ -558,7 +583,7 @@ def _attr_refine(fn: str, sc: "Scopes", k: ast.ClassDef, st: ast.stmt, m: Map) -
     return users & readers
 
 
-def _ast_diffs(a: ast.AST, b: ast.AST, out: list | None = None, parent=None) -> list:
+def _ast_diffs(a: ast.AST, b: ast.AST, out: list | None = None, parent=None, skip_function_bodies=False) -> list:
     """Smallest differing node pairs between two trees (stops after 2)."""
     out = [] if out is None else out
     if len(out) > 1:
@@ -568,15 +593,17 @@ def _ast_diffs(a: ast.AST, b: ast.AST, out: list | None = None, parent=None) -> 
         return out
     if isinstance(a, ast.AST):
         for f in a._fields:
+            if skip_function_bodies and f == "body" and isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
             va, vb = getattr(a, f, None), getattr(b, f, None)
             if isinstance(va, list) and isinstance(vb, list):
                 if len(va) != len(vb):
                     out.append((parent, a, b))
                     return out
                 for x, y in zip(va, vb):
-                    _ast_diffs(x, y, out, a)
+                    _ast_diffs(x, y, out, a, skip_function_bodies)
             elif isinstance(va, ast.AST) or isinstance(vb, ast.AST):
-                _ast_diffs(va, vb, out, a)
+                _ast_diffs(va, vb, out, a, skip_function_bodies)
             elif va != vb or type(va) is not type(vb):
                 out.append((parent, a, b))
                 return out
