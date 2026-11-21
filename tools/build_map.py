@@ -137,7 +137,19 @@ if len(sys.argv) > 4:
             ln = node.lineno
             st = sc.stmt[ln] if ln < len(sc.stmt) else None
             func = sc.func[ln] if ln < len(sc.func) else None
+            cls = sc.cls[ln] if ln < len(sc.cls) else None
             safe = 1
+            if func is None and cls is not None and st is not None and st in cls.body and isinstance(st, (ast.Assign, ast.AnnAssign)):
+                # class-body copy such as X = {**Parent.X, ...}: only matters for that class
+                tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+                if all(isinstance(x, ast.Name) and x.id == name for x in tg):
+                    via = ""
+                    if isinstance(node, ast.Attribute):
+                        v = node.value
+                        via = v.attr if isinstance(v, ast.Attribute) else (v.id if isinstance(v, ast.Name) else "?")
+                    mod = blast.module_name(rel)
+                    attrs.setdefault(name, []).append([rel, ln, ln, 2, f"{mod}:{sc.qualname(cls)}", via])
+                    continue
             if st is None or func is None or ln < func.body[0].lineno or func.name in DUNDER:
                 safe = 0
                 lo = hi = ln
@@ -146,7 +158,7 @@ if len(sys.argv) > 4:
                 if not (lo <= ln <= hi):
                     lo, hi = ln, ln
                 if any(l in collect.get(rel, ()) for l in range(lo, hi + 1)):
-                    safe = 0
+                    safe = 3
             attrs.setdefault(name, []).append([rel, lo, hi, safe])
     data["attrs"] = attrs
 with gzip.open(out, "wt") as fh:

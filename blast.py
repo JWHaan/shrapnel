@@ -354,6 +354,13 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
             if fn == "tests/helpers.py" or not Path(fn).name.startswith("test_"):
                 imp.tests |= m.touch(fn)
             continue
+        lam = _lambda_at(st, ln)
+        if lam is not None:
+            got = m.tests_on(fn, lam.body.lineno, lam.body.end_lineno or lam.body.lineno)
+            imp.ranges.append((fn, lam.body.lineno, lam.body.end_lineno or lam.body.lineno))
+            imp.line_tests |= got
+            imp.notes.append(f"{fn}:{ln} lambda body -> {len(got)}")
+            continue
         k = sc.cls[ln]
         if k is not None and st in k.body and isinstance(st, (ast.Assign, ast.AnnAssign)) and m.attrs:
             refined = _attr_refine(fn, sc, k, st, m)
@@ -384,6 +391,18 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
         imp.tests |= {t for t in o if t >= 0}
 
 
+def _lambda_at(st: ast.AST, ln: int) -> ast.Lambda | None:
+    """Innermost lambda in st whose body holds line ln (strictly below the lambda keyword)."""
+    best = None
+    for node in ast.walk(st):
+        if isinstance(node, ast.Lambda):
+            b = node.body
+            if node.lineno < ln <= (b.end_lineno or b.lineno) and b.lineno <= ln:
+                if best is None or node.lineno >= best.lineno:
+                    best = node
+    return best
+
+
 def _users_of(fn: str, sc: "Scopes", k: ast.AST, m: Map) -> set[int]:
     """Tests using class k or any class it is nested in."""
     out: set[int] = set()
@@ -394,6 +413,18 @@ def _users_of(fn: str, sc: "Scopes", k: ast.AST, m: Map) -> set[int]:
             out |= m.class_users(f"{mod}:{sc.qualname(n)}")
         n = sc.parent.get(n)
     return out
+
+
+def _used_at_collect(fn: str, sc: "Scopes", k: ast.AST, m: Map) -> bool:
+    mod = module_name(fn)
+    n = k
+    while n is not None and not isinstance(n, ast.Module):
+        if isinstance(n, ast.ClassDef):
+            s = m.classes.get(f"{mod}:{sc.qualname(n)}")
+            if s is not None and -1 in m.sets[s]:
+                return True
+        n = sc.parent.get(n)
+    return False
 
 
 def _attr_refine(fn: str, sc: "Scopes", k: ast.ClassDef, st: ast.stmt, m: Map) -> set[int] | None:
@@ -410,8 +441,18 @@ def _attr_refine(fn: str, sc: "Scopes", k: ast.ClassDef, st: ast.stmt, m: Map) -
         refs = m.attrs.get(name)
         if refs is None:
             continue  # nobody reads it
-        for rf, lo, hi, safe in refs:
-            if not safe:
+        for rf, lo, hi, safe, *extra in refs:
+            if safe == 2:
+                # another class copies NAME at definition time; it sees k's value only if it
+                # names k explicitly (subclasses reaching it by inheritance are users of k already)
+                if extra and extra[1] in (k.name, "?"):
+                    users |= m.class_users(extra[0])
+                continue
+            if safe == 3:
+                # reader also runs at import time: fine unless k was in use then
+                if _used_at_collect(fn, sc, k, m):
+                    return None
+            elif not safe:
                 return None
             readers |= m.tests_on(rf, lo, hi)
     return users & readers
