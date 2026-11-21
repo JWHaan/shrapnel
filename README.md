@@ -11,7 +11,11 @@ Picks the sqlglot tests a patch can break, then checks the cheap ones for real.
    - per pool task coverage for the big fixture-driven tests (TPC-DS, simplify, ...);
    - which sqlglot classes each test uses (the MRO of every `self`/`cls` a method runs with);
    - which data files each test opens; which lines read each class attribute;
-   - each test's CPU cost when run in-process.
+   - each test's CPU cost when run in-process;
+   - comparison operands (`tools/cmp_plugin.py`): every single-operator comparison in sqlglot is
+     rewritten to record, per test, whether `is` and `==` agreed and up to 24 primitive operand
+     pairs. When a patch's only change is one comparison (operator swap or compared constant),
+     tests whose recorded operands give the same result before and after are dropped.
 2. **For each patch** (`blast.py`): apply it in pure Python, compare ASTs (comment-only edits
    drop out), map each changed statement to the tests that run it. Class-body edits go to the
    tests that use that class *and* run a line reading that attribute, falling back to every user

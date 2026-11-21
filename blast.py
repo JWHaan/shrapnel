@@ -113,6 +113,7 @@ class Map:
         self.opens: dict[str, int] = d["opens"]
         self.classes: dict[str, int] = d.get("classes", {})
         self.attrs: dict[str, list] = d.get("attrs", {})
+        self.cmp: dict = d.get("cmp", {})
         self.tasks: dict[int, dict] = {int(k): v for k, v in d.get("tasks", {}).items()}
         for v in self.tasks.values():
             v["base"] = {f: set(ls) for f, ls in v.get("base", {}).items()}
@@ -286,7 +287,8 @@ def _class_shell(node: ast.ClassDef) -> str:
     return ast.dump(ast.ClassDef(name=node.name, bases=node.bases, keywords=node.keywords, body=body, decorator_list=node.decorator_list, type_params=[])) + "|".join(heads)
 
 
-def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str | None = None) -> None:
+def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str | None = None, only_file: bool = False) -> None:
+    single_change = None
     try:
         sc = Scopes(src)
     except SyntaxError:
@@ -312,6 +314,10 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
                 imp.tests |= {t for t in o if t >= 0}
             return
         old_defs, new_defs = _defs(sc.tree), _defs(new_tree)
+        if only_file:
+            d = _ast_diffs(sc.tree, new_tree)
+            if len(d) == 1:
+                single_change = d[0]
     probes: set[int] = set(l for l in fd.removed if 1 <= l <= sc.nlines)
     for p in fd.inserts:
         for q in (p, p + 1):
@@ -345,6 +351,11 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
             if not (lo <= ln <= hi):
                 lo, hi = ln, ln
             got = m.tests_on(fn, lo, hi)
+            if single_change is not None and got:
+                kept = _cmp_refine(fn, single_change, got, m)
+                if kept is not None:
+                    imp.notes.append(f"{fn}:{ln} comparison evidence {len(got)} -> {len(kept)}")
+                    got = kept
             imp.ranges.append((fn, lo, hi))
             imp.line_tests |= got
             continue
@@ -458,6 +469,126 @@ def _attr_refine(fn: str, sc: "Scopes", k: ast.ClassDef, st: ast.stmt, m: Map) -
     return users & readers
 
 
+def _ast_diffs(a: ast.AST, b: ast.AST, out: list | None = None, parent=None) -> list:
+    """Smallest differing node pairs between two trees (stops after 2)."""
+    out = [] if out is None else out
+    if len(out) > 1:
+        return out
+    if type(a) is not type(b):
+        out.append((parent, a, b))
+        return out
+    if isinstance(a, ast.AST):
+        for f in a._fields:
+            va, vb = getattr(a, f, None), getattr(b, f, None)
+            if isinstance(va, list) and isinstance(vb, list):
+                if len(va) != len(vb):
+                    out.append((parent, a, b))
+                    return out
+                for x, y in zip(va, vb):
+                    _ast_diffs(x, y, out, a)
+            elif isinstance(va, ast.AST) or isinstance(vb, ast.AST):
+                _ast_diffs(va, vb, out, a)
+            elif va != vb or type(va) is not type(vb):
+                out.append((parent, a, b))
+                return out
+        return out
+    if a != b or type(a) is not type(b):
+        out.append((parent, a, b))
+    return out
+
+
+_CMPF = {
+    ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b, ast.Is: lambda a, b: a is b,
+    ast.IsNot: lambda a, b: a is not b, ast.Lt: lambda a, b: a < b, ast.LtE: lambda a, b: a <= b,
+    ast.Gt: lambda a, b: a > b, ast.GtE: lambda a, b: a >= b,
+    ast.In: lambda a, b: a in b, ast.NotIn: lambda a, b: a not in b,
+}
+
+
+def _cmp_refine(fn: str, change, got: set[int], m: Map) -> set[int] | None:
+    """Drop tests whose recorded operands give the same result before and after the change."""
+    if not m.cmp:
+        return None
+    parent, a, b = change
+    # locate the comparison: either the changed node itself, or a Constant directly inside it
+    if isinstance(a, ast.cmpop) and isinstance(b, ast.cmpop) and isinstance(parent, ast.Compare):
+        if len(parent.ops) != 1:
+            return None
+        cmp_old = parent
+        cmp_new = ast.Compare(left=parent.left, ops=[b], comparators=parent.comparators)
+        side = None
+    elif isinstance(a, ast.Constant) and isinstance(parent, ast.Compare) and len(parent.ops) == 1:
+        cmp_old = parent
+        if parent.left is a:
+            side = 0
+        elif parent.comparators[0] is a:
+            side = 1
+        else:
+            return None
+        cmp_new = None
+    else:
+        return None
+    site = m.cmp["sites"].get(f"{fn}:{cmp_old.lineno}:{cmp_old.col_offset}")
+    done = set(m.sets[m.cmp["done"]])
+    old_op = type(cmp_old.ops[0])
+    f_old = _CMPF.get(old_op)
+    if f_old is None:
+        return None
+    if site is None:
+        # profiled tests never evaluated it; keep only unprofiled ones
+        return {t for t in got if t not in done}
+    observed = set(m.sets[site[0]])
+    disagree = set(m.sets[site[1]])
+    overflow = set(m.sets[site[2]])
+    pair_of: dict[int, list] = {}
+    for prs, sidx in site[3]:
+        for t in m.sets[sidx]:
+            pair_of[t] = prs
+    keep: set[int] = set()
+    if cmp_new is not None:
+        new_op = type(cmp_new.ops[0])
+        f_new = _CMPF.get(new_op)
+        if f_new is None:
+            return None
+        swap = {frozenset((ast.Eq, ast.Is)), frozenset((ast.NotEq, ast.IsNot))}
+        for t in got:
+            if t not in done:
+                keep.add(t)
+            elif t not in observed:
+                continue
+            elif frozenset((old_op, new_op)) in swap:
+                if t in disagree:
+                    keep.add(t)
+            elif t in overflow or t not in pair_of or not _same(pair_of[t], f_old, f_new, None, None):
+                keep.add(t)
+        return keep
+    new_val = b.value
+    for t in got:
+        if t not in done:
+            keep.add(t)
+        elif t not in observed:
+            continue
+        elif t in overflow or t not in pair_of or not _same(pair_of[t], f_old, f_old, side, new_val):
+            keep.add(t)
+    return keep
+
+
+def _same(prs, f_old, f_new, side, new_val) -> bool:
+    try:
+        for ra, rb in prs:
+            x, y = ast.literal_eval(ra), ast.literal_eval(rb)
+            x2, y2 = x, y
+            if side == 0:
+                x2 = new_val
+            elif side == 1:
+                y2 = new_val
+            if bool(f_old(x, y)) != bool(f_new(x2, y2)):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _find_class(tree, qual):
     node = tree
     for part in qual.split("."):
@@ -492,7 +623,8 @@ def _doc_users(fn: str, m: Map) -> set[int]:
 
 def impact(patch_text: str, m: Map, root: Path, patched_root: Path | None = None) -> Impact:
     imp = Impact()
-    for fd in parse_patch(patch_text):
+    diffs = parse_patch(patch_text)
+    for fd in diffs:
         for fn in {f for f in (fd.old, fd.new) if f}:
             o = m.opened(fn)
             if o:
@@ -525,7 +657,7 @@ def impact(patch_text: str, m: Map, root: Path, patched_root: Path | None = None
             if patched_root is not None:
                 q = patched_root / fn
                 new_src = q.read_text(encoding="utf-8", errors="replace") if q.exists() else None
-            py_impact(fn, p.read_text(encoding="utf-8"), fd, m, imp, new_src)
+            py_impact(fn, p.read_text(encoding="utf-8"), fd, m, imp, new_src, only_file=len(diffs) == 1)
         elif fn.startswith("tests/fixtures/"):
             if m.opened(fn) is None:
                 imp.notes.append(f"{fn}: fixture never opened")
