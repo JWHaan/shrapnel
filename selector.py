@@ -11,6 +11,9 @@ from pathlib import Path
 APP = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP))
 import blast  # noqa: E402
+import escape_reads  # noqa: E402
+import fast_impact  # noqa: E402
+import mapping_impact  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 ROOT = Path(os.environ.get("BR_SQLGLOT", "/opt/sqlglot"))
@@ -158,25 +161,40 @@ def main() -> None:
             if m is not None:
                 edits = blast.modified_files(patch.read_text(encoding="utf-8"), ROOT)
                 imp = blast.Impact()
-                for fd, before, after in edits:
-                    fn = fd.old
-                    if fn.endswith(".py") and fn.startswith(("sqlglot/", "tests/")):
-                        if Path(fn).name in {"conftest.py", "__init__.py"}:
-                            raise ValueError("collection or package initialization")
-                        if fn not in m.lines:
-                            raise ValueError("source without per-test coverage")
-                        compile(after, fn, "exec", dont_inherit=True)
-                        blast.py_impact(fn, before, fd, m, imp, after, only_file=len(edits) == 1)
-                    elif fn.startswith("tests/fixtures/"):
-                        readers = m.opened(fn)
-                        if readers is None or -1 in readers:
-                            raise ValueError("unknown or collection-time fixture readers")
-                        imp.tests.update(readers)
-                    else:
-                        raise ValueError("unsupported file")
+                try:
+                    for fd, before, after in edits:
+                        fn = fd.old
+                        if fn.endswith(".py") and fn.startswith(("sqlglot/", "tests/")):
+                            if Path(fn).name in {"conftest.py", "__init__.py"}:
+                                raise ValueError("collection or package initialization")
+                            if fn not in m.lines:
+                                raise ValueError("source without per-test coverage")
+                            compile(after, fn, "exec", dont_inherit=True)
+                            subset = fast_impact.narrow_sources(before, after, fd)
+                            if subset is not None:
+                                before, after = subset
+                            blast.py_impact(fn, before, fd, m, imp, after, only_file=len(edits) == 1)
+                        elif fn.startswith("tests/fixtures/"):
+                            readers = m.opened(fn)
+                            if readers is None or -1 in readers:
+                                raise ValueError("unknown or collection-time fixture readers")
+                            imp.tests.update(readers)
+                        else:
+                            raise ValueError("unsupported file")
+                except Exception as exc:
+                    print(f"{patch.stem}: {exc!r}", file=sys.stderr)
+                    imp.everything = True
                 if not imp.everything and not imp.syntax_error:
                     selected = {remap[t] for t in imp.tests | imp.line_tests if t in remap}
                     workers = final_pack(sorted(selected | unknown), secs)
+                else:
+                    keep = escape_reads.tests_for(edits, m)
+                    if keep is None and len(edits) == 1:
+                        fd, before, after = edits[0]
+                        keep = mapping_impact.value_only_tests(fd.old, before, after, m)
+                    if keep is not None:
+                        selected = {remap[t] for t in keep if t in remap}
+                        workers = final_pack(sorted(selected | unknown), secs)
         except Exception as exc:
             print(f"{patch.stem}: full suite ({exc!r})", file=sys.stderr)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))

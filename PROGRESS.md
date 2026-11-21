@@ -165,3 +165,41 @@ contains per-patch counts, worker counts and costs against the frozen arms;
 Next experiment: capture complete, side-effect-free comparison outcomes for
 expensive line visitors on the clean pin, with explicit pass and process
 coverage. Do not reinstate the historical rule to reach a sample target.
+
+## Certified keep-sets behind the full-suite fallback
+
+The submitted arm e8fa7d7 scored 396.373 simulated seconds officially with
+zero commits missed and about 1.8 s CPU: pure over-selection. The
+everything guard retains the whole catalogue at about 36.8 s for each
+unrecognised definition-time edit and collection-time read.
+
+Three modules now sit behind that guard. `escape_reads` certifies
+single-integer edits to the pinned NUMERIC_ESCAPES tables; `mapping_impact`
+certifies value-only literal replacements inside closed pinned bindings.
+Both verify file digests, map identity and coverage receipts and return
+None on any doubt, so the full-suite fallback is preserved. `fast_impact`
+slices unchanged source regions before `py_impact` from a SHA-pinned index
+with AST-equality and position checks. Keep-sets are only consulted when
+`py_impact` cannot produce a selection: everything, syntax_error or a loop
+exception. An earlier wiring that replaced valid `py_impact` selections
+cost 22.242 s on the public batch when a certified set pulled globally
+unknown tests into patch 4d63 (12.7 to 34.8 s makespan).
+
+| Dataset | Patches | Simulated s | Misses |
+| --- | ---: | ---: | ---: |
+| Public | 30 | 176.631 | 0 |
+| Independent, full | 11 | 157.002 | 0 |
+| Archived, historical labels | 48 | 748.585 | 0 |
+
+Outputs matched e8fa7d7 byte-for-byte on all three sets, so this arm cannot
+do worse locally and can only gain on hidden everything-class edits that
+match a certified profile. Selector CPU rose about 0.5 s from module
+loading. No hidden score measured for this arm yet.
+
+Reproduce: `docker build --platform linux/amd64 -t shrapnel-local:keep
+entry`, then `bash work/bench.sh shrapnel-local:keep entry/sample
+work/keep-public`. Receipts in `work/keep-*.jsonl`, `work/e8-*.jsonl`.
+
+Next: narrow the everything guard itself with audited module-import and
+call-site evidence instead of the whole catalogue; the keep-sets only
+cover certified value-table profiles.
