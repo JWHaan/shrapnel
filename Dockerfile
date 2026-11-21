@@ -7,6 +7,6 @@ RUN python -c "import io,tarfile,urllib.request; d=urllib.request.urlopen('https
  && mv /opt/sqlglot-${SQLGLOT_SHA} /opt/sqlglot \
  && chmod -R a+rX /opt/sqlglot
 COPY blast.py selector.py /app/
-COPY maps /app/maps
+COPY maps/map.json.gz maps/calls.json.gz /app/maps/
 RUN python -m compileall -q /app && chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]

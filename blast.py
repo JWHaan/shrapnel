@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import gzip
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -119,6 +120,13 @@ class Map:
             v["base"] = {f: set(ls) for f, ls in v.get("base", {}).items()}
         self.file_of = [i.split("::")[0] if i else "" for i in self.ids]
         self._touch: dict[str, set[int]] = {}
+        self.calls = {}
+        sidecar = path.with_name("calls.json.gz")
+        if sidecar.is_file():
+            with gzip.open(sidecar, "rt") as fh:
+                evidence = json.load(fh)
+            if evidence["ids_sha256"] == hashlib.sha256("\n".join(self.ids).encode()).hexdigest():
+                self.calls = evidence
 
     def tests_on(self, fn: str, lo: int, hi: int) -> set[int]:
         m = self.lines.get(fn)
@@ -307,17 +315,27 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
             imp.syntax_error = True
             imp.notes.append(f"{fn}: patched file does not parse")
             return
-        if ast.dump(new_tree) == ast.dump(sc.tree):
+        d = _ast_diffs(sc.tree, new_tree)
+        if not d:
             imp.notes.append(f"{fn}: AST unchanged")
             o = m.opened(fn)
             if o:
                 imp.tests |= {t for t in o if t >= 0}
             return
-        old_defs, new_defs = _defs(sc.tree), _defs(new_tree)
-        if only_file:
-            d = _ast_diffs(sc.tree, new_tree)
-            if len(d) == 1:
-                single_change = d[0]
+        if only_file and len(d) == 1:
+            single_change = d[0]
+            if m.calls:
+                kept = _call_refine(fn, sc, single_change, m)
+                if kept is not None:
+                    imp.tests |= kept | {t for t in (m.opened(fn) or ()) if t >= 0}
+                    imp.notes.append(f"{fn}: call evidence -> {len(kept)}")
+                    return
+        # A lone replaced expression cannot be in an unchanged enclosing
+        # definition. Avoid dumping all the unrelated definitions in that file.
+        anchor = d[0][1] if isinstance(d[0][1], ast.expr) else d[0][0]
+        if not (len(d) == 1 and len(fd.removed) == 1 and not fd.inserts and isinstance(anchor, ast.expr)
+                and anchor.lineno <= fd.removed[0] <= anchor.end_lineno):
+            old_defs, new_defs = _defs(sc.tree), _defs(new_tree)
     probes: set[int] = set(l for l in fd.removed if 1 <= l <= sc.nlines)
     for p in fd.inserts:
         for q in (p, p + 1):
@@ -414,6 +432,77 @@ def _lambda_at(st: ast.AST, ln: int) -> ast.Lambda | None:
     return best
 
 
+def _call_refine(fn, sc, change, m):
+    """Find the call that must observe a single value edit, not its import-time definition."""
+    parent, old, new = change
+    if not fn.startswith("sqlglot/") or -1 in (m.opened(fn) or ()):
+        return None
+    calls = m.calls
+    category, site, source = "calls", None, fn
+    candidates = None
+    if isinstance(old, ast.Constant) and isinstance(new, ast.Constant):
+        # At this pin, booleans in Expr.arg_types are only consumed by
+        # __init_subclass__ -> required_args -> Expression.error_messages.
+        # Keys, copied declarations and arbitrary dictionary edits aren't equivalent.
+        if (fn.startswith("sqlglot/expressions/") and type(old.value) is bool and type(new.value) is bool
+                and isinstance(parent, ast.Dict) and old in parent.values):
+            st = sc.parent.get(parent)
+            cls = sc.parent.get(st)
+            if (isinstance(cls, ast.ClassDef) and isinstance(st, ast.Assign) and st.value is parent
+                    and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)
+                    and st.targets[0].id == "arg_types" and m.attrs.get("arg_types")
+                    and not any(r[3] == 2 and r[5] in {cls.name, "?"} for r in m.attrs["arg_types"])):
+                category, site = "validated", f"{module_name(fn)}:{sc.qualname(cls)}"
+        call = sc.parent.get(parent) if isinstance(parent, ast.keyword) else parent
+        if isinstance(call, ast.Call):
+            factory = calls["factories"].get(f"{fn}:{call.lineno}:{call.col_offset}")
+            if factory:
+                source = factory.rsplit(":", 1)[0]
+                site = factory
+                # Many declarations may use the same factory; retain its calls
+                # among the existing candidates for the declaring class.
+                cls = sc.cls[call.lineno]
+                if cls is None:
+                    return None
+                candidates = m.touch(fn) | _users_of(fn, sc, cls, m)
+    if site is None:
+        # Limit this proof to changes that cannot affect closure binding or
+        # turn an ordinary lambda into a generator (or vice versa).
+        if not any(isinstance(old, typ) and isinstance(new, typ)
+                   for typ in (ast.Constant, ast.cmpop, ast.boolop, ast.operator, ast.unaryop)):
+            return None
+        node = old if isinstance(old, ast.expr) else parent
+        while node is not None:
+            outer = sc.parent.get(node)
+            if isinstance(outer, ast.Lambda) and outer.body is node:
+                site = f"{fn}:{outer.lineno}"
+                break
+            node = outer
+    if site is None:
+        return None
+    observed = set(calls[category].get(site, ()))
+    if category == "validated" and -1 in observed:
+        key = parent.keys[parent.values.index(old)]
+        missing = calls.get("collect_missing", {}).get(site)
+        if isinstance(key, ast.Constant) and isinstance(key.value, str) and missing is not None:
+            if "*" not in missing and key.value not in missing:
+                observed.remove(-1)
+    extra = calls["inspected"]
+    unknown = set(calls["unknown"]) | set(extra.get("<child>", ()))
+    inspected = set(extra.get(module_name(source), ()))
+    if -1 in observed or -1 in unknown or -1 in inspected:
+        return None  # collection may have propagated the value to any test
+    if candidates is not None:
+        observed &= candidates
+    elif unknown:
+        # No call evidence for these tests: keep the original broader
+        # file/class coverage, including a child interpreter's pristine lines.
+        line = old.lineno if isinstance(old, ast.expr) else parent.lineno
+        cls = sc.cls[line]
+        candidates = m.touch(fn) | (_users_of(fn, sc, cls, m) if cls else _module_users(fn, sc, m))
+    return observed | (unknown & candidates if unknown else set()) | inspected
+
+
 def _users_of(fn: str, sc: "Scopes", k: ast.AST, m: Map) -> set[int]:
     """Tests using class k or any class it is nested in."""
     out: set[int] = set()
@@ -507,7 +596,7 @@ _CMPF = {
 
 def _cmp_refine(fn: str, change, got: set[int], m: Map) -> set[int] | None:
     """Drop tests whose recorded operands give the same result before and after the change."""
-    if not m.cmp:
+    if not m.cmp or not fn.startswith("sqlglot/"):
         return None
     parent, a, b = change
     # locate the comparison: either the changed node itself, or a Constant directly inside it
@@ -517,7 +606,7 @@ def _cmp_refine(fn: str, change, got: set[int], m: Map) -> set[int] | None:
         cmp_old = parent
         cmp_new = ast.Compare(left=parent.left, ops=[b], comparators=parent.comparators)
         side = None
-    elif isinstance(a, ast.Constant) and isinstance(parent, ast.Compare) and len(parent.ops) == 1:
+    elif isinstance(a, ast.Constant) and isinstance(b, ast.Constant) and isinstance(parent, ast.Compare) and len(parent.ops) == 1:
         cmp_old = parent
         if parent.left is a:
             side = 0
@@ -528,15 +617,24 @@ def _cmp_refine(fn: str, change, got: set[int], m: Map) -> set[int] | None:
         cmp_new = None
     else:
         return None
+    if cmp_old.lineno in m.collect.get(fn, ()):
+        return None  # cmp_plugin clears its observations after collection
     site = m.cmp["sites"].get(f"{fn}:{cmp_old.lineno}:{cmp_old.col_offset}")
     done = set(m.sets[m.cmp["done"]])
+    if m.calls:
+        done.difference_update(m.calls["inspected"].get("<child>", ()))
     old_op = type(cmp_old.ops[0])
     f_old = _CMPF.get(old_op)
     if f_old is None:
         return None
+    identity = (ast.Is, ast.IsNot)
+    if side is not None and old_op in identity and not (
+        type(a.value) in (bool, type(None)) and type(b.value) in (bool, type(None))
+    ):
+        return None  # repr does not preserve object identity
     if site is None:
-        # profiled tests never evaluated it; keep only unprofiled ones
-        return {t for t in got if t not in done}
+        # A rich comparison can raise before the tracing helper records it.
+        return got - done if old_op in (ast.Is, ast.IsNot) else None
     observed = set(m.sets[site[0]])
     disagree = set(m.sets[site[1]])
     overflow = set(m.sets[site[2]])
@@ -551,13 +649,16 @@ def _cmp_refine(fn: str, change, got: set[int], m: Map) -> set[int] | None:
         if f_new is None:
             return None
         swap = {frozenset((ast.Eq, ast.Is)), frozenset((ast.NotEq, ast.IsNot))}
+        if (old_op in identity or new_op in identity) and frozenset((old_op, new_op)) not in swap:
+            return None
         for t in got:
             if t not in done:
                 keep.add(t)
             elif t not in observed:
-                continue
+                if old_op not in (ast.Is, ast.IsNot):
+                    keep.add(t)
             elif frozenset((old_op, new_op)) in swap:
-                if t in disagree:
+                if t in disagree or ast.NotEq in (old_op, new_op) and t in overflow:
                     keep.add(t)
             elif t in overflow or t not in pair_of or not _same(pair_of[t], f_old, f_new, None, None):
                 keep.add(t)
@@ -567,7 +668,8 @@ def _cmp_refine(fn: str, change, got: set[int], m: Map) -> set[int] | None:
         if t not in done:
             keep.add(t)
         elif t not in observed:
-            continue
+            if old_op not in (ast.Is, ast.IsNot):
+                keep.add(t)
         elif t in overflow or t not in pair_of or not _same(pair_of[t], f_old, f_old, side, new_val):
             keep.add(t)
     return keep

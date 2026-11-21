@@ -1,6 +1,7 @@
 # Blast Radius entry
 
-Picks the sqlglot tests a patch can break, then checks the cheap ones for real.
+Schedules SQLGlot tests using evidence from the pinned revision. The runtime
+uses the Python standard library and does not execute or import patched code.
 
 ## How it works
 
@@ -20,12 +21,13 @@ Picks the sqlglot tests a patch can break, then checks the cheap ones for real.
    drop out), map each changed statement to the tests that run it. Class-body edits go to the
    tests that use that class *and* run a line reading that attribute, falling back to every user
    of the class when the attribute is read at import time.
-3. **Runtime check** (`selector.py`): when it is cheaper than scheduling them blind, run the
-   candidate tests against the patched tree (a symlink overlay in `/tmp`, forked from a process
-   with pytest/duckdb/pandas already imported) and keep only the failures. Heavy pooled tests run
-   only the tasks that reach the change. Anything that times out, crashes or does not report is
-   scheduled anyway.
-4. Pack the chosen tests onto 1–8 workers (longest first, best worker count).
+3. **Call evidence** (`tools/build_calls.py`): distinguish a lambda or closure being
+   defined from its body being invoked. For a boolean required-argument edit, track
+   validation of that expression class. Unprofiled tests keep broader coverage.
+4. **Scheduling** (`selector.py`): compare up to eight worker counts in whole milliseconds,
+   balance uneven loads and add extra tests only within the winning schedule's spare
+   capacity. Unsupported patch formats, syntax errors and analysis exceptions schedule
+   the full inventory. Only patches and the test manifest are mounted at runtime.
 
 ## Rebuilding the maps
 
@@ -39,3 +41,6 @@ python3 tools/build_map.py ../mapout sample/tests.json maps/map.json.gz ../sqlgl
 ```
 
 `make sample` scores the 30 sample commits locally.
+
+See `tools/build_calls.py` for the call-profile build from a clean pinned Git
+archive, and `PROGRESS.md` for measurements and validation limits.

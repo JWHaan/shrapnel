@@ -158,6 +158,8 @@ def main() -> None:
                     if fn.endswith(".py") and fn.startswith(("sqlglot/", "tests/")):
                         if Path(fn).name in {"conftest.py", "__init__.py"}:
                             raise ValueError("collection or package initialization")
+                        if fn not in m.lines:
+                            raise ValueError("source without per-test coverage")
                         compile(after, fn, "exec", dont_inherit=True)
                         blast.py_impact(fn, before, fd, m, imp, after, only_file=len(edits) == 1)
                     elif fn.startswith("tests/fixtures/"):

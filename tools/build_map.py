@@ -165,15 +165,16 @@ if len(sys.argv) > 4:
 # comparison operand evidence (optional): $CMP_DIR holds cmp-*.json from cmp_plugin
 cmp_dir = os.environ.get("CMP_DIR")
 if cmp_dir:
-    observed, disagree, overflow, pairs, badc = {}, {}, {}, {}, []
+    observed, disagree, overflow, pairs = {}, {}, {}, {}
+    done = set()
     for f in glob.glob(f"{cmp_dir}/cmp-*.json"):
         d = json.load(open(f))
         n = num.get(d["test"])
         if n is None:
             continue
         if not d["ok"]:
-            badc.append(n)
             continue
+        done.add(n)
         for site, (agree, prs) in d["obs"].items():
             observed.setdefault(site, set()).add(n)
             if not agree:
@@ -182,7 +183,6 @@ if cmp_dir:
                 overflow.setdefault(site, set()).add(n)
             else:
                 pairs.setdefault(site, {}).setdefault(json.dumps(prs), set()).add(n)
-    done = {num[t] for t in num} - set(badc)
     data["cmp"] = {
         "done": sid(done),
         "sites": {
@@ -191,7 +191,7 @@ if cmp_dir:
             for site, obs in observed.items()
         },
     }
-    print(f"cmp sites={len(observed)} unprofiled tests={len(badc)}", file=sys.stderr)
+    print(f"cmp sites={len(observed)} unprofiled tests={len(num)-len(done)}", file=sys.stderr)
 
 with gzip.open(out, "wt") as fh:
     json.dump(data, fh, separators=(",", ":"))

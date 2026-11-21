@@ -1,7 +1,8 @@
 """pytest plugin: record, per test, which sqlglot/test source lines run and which files open.
 
 Used only to build maps from the pinned sqlglot commit. Writes one JSON file per
-process into $MAP_OUT.
+process into $MAP_OUT. MAP_CALLS=1 records nested function starts, validation
+receivers and opaque consumers instead of ordinary lines, classes and opens.
 """
 import json
 import os
@@ -13,12 +14,15 @@ ROOT = os.environ.get("MAP_ROOT", "/src")
 OUT = os.environ.get("MAP_OUT", "/out")
 MON = sys.monitoring
 TOOL = MON.COVERAGE_ID
+CALLS = os.environ.get("MAP_CALLS") == "1"
+CALL_PLAN = set(json.load(open(os.environ["MAP_CALL_PLAN"]))) if CALLS and "MAP_CALL_PLAN" in os.environ else None
 
 _current = {"key": "<collect>"}
 _task: dict[str, int] = {}
 _lines: dict[str, dict[str, set[int]]] = {}
 _opens: dict[str, set[str]] = {}
 _classes: dict[str, set[str]] = {}
+_collect_missing: dict[str, set[str]] = {}
 _mro_cache: dict[type, tuple[str, ...]] = {}
 _getframe = sys._getframe
 
@@ -73,6 +77,40 @@ def _on_line(code, line):
         s = b[rel] = set()
     s.add(line)
     return MON.DISABLE
+
+
+def _on_call(code, offset):
+    if not code.co_filename.startswith(_prefix + "sqlglot/"):
+        return MON.DISABLE
+    if code.co_qualname == "Expression.error_messages":
+        # Validation reads the required-argument values, not just the keys.
+        obj = _getframe(1).f_locals["self"]
+        names = _mro_names(type(obj))
+        _classes.setdefault(_current["key"], set()).update(names)
+        if _current["key"] == "<collect>":
+            # Changing the required flag of a supplied field can't introduce
+            # a collection error. Preserve cases with existing missing fields:
+            # even the order of errors from iterating a set could change.
+            absent = {k for k in obj.arg_types if (v := obj.args.get(k)) is None or isinstance(v, list) and not v}
+            if absent & obj.required_args:
+                absent.add("*")
+            for name in names:
+                _collect_missing.setdefault(name, set()).update(absent)
+        return None
+    if code.co_name == "<lambda>" or ".<locals>." in code.co_qualname:
+        return _on_line(code, code.co_firstlineno)
+    return MON.DISABLE
+
+
+def _call_audit(event, args):
+    if event == "subprocess.Popen" or event == "os.fork" and _current["key"] != "<collect>":
+        _opens.setdefault(_current["key"], set()).add("<child>")
+    elif event == "object.__getattr__" and args[1] == "__code__":
+        # Don't assume an uncalled callable is opaque to introspection.
+        from types import FunctionType
+
+        if isinstance(args[0], FunctionType) and (args[0].__module__ or "").startswith("sqlglot"):
+            _opens.setdefault(_current["key"], set()).add(args[0].__module__)
 
 
 def _audit(event, args):
@@ -137,6 +175,13 @@ def pytest_configure(config):
 
     concurrent.futures.ProcessPoolExecutor = InlineExecutor
     MON.use_tool_id(TOOL, "mapper")
+    if CALLS:
+        if "sqlglot" in sys.modules:
+            raise RuntimeError("SQLGlot imported before call instrumentation")
+        MON.register_callback(TOOL, MON.events.PY_START, _on_call)
+        MON.set_events(TOOL, MON.events.PY_START)
+        sys.addaudithook(_call_audit)
+        return
     MON.register_callback(TOOL, MON.events.LINE, _on_line)
     MON.register_callback(TOOL, MON.events.PY_START, _on_start)
     MON.set_events(TOOL, MON.events.LINE | MON.events.PY_START)
@@ -148,6 +193,8 @@ def pytest_runtest_protocol(item, nextitem):
     """Run every test in a forked child so caches filled by earlier tests do not hide lines."""
     from _pytest.runner import runtestprotocol
 
+    if CALL_PLAN is not None and item.nodeid not in CALL_PLAN:
+        return True
     pid = os.fork()
     if pid == 0:
         _lines.clear()
@@ -159,7 +206,9 @@ def pytest_runtest_protocol(item, nextitem):
         ok = True
         try:
             reports = runtestprotocol(item, nextitem=None, log=False)
-            ok = all(not r.failed for r in reports)
+            ok = all(not r.failed for r in reports) and (not CALLS or any(
+                r.when == "call" and r.passed for r in reports
+            ))
         except BaseException:
             ok = False
         MON.set_events(TOOL, 0)
@@ -172,7 +221,7 @@ def pytest_runtest_protocol(item, nextitem):
         import hashlib
 
         h = hashlib.sha1(item.nodeid.encode()).hexdigest()[:16]
-        with open(os.path.join(OUT, f"map-t{h}.json"), "w") as fh:
+        with open(os.path.join(OUT, f"{'calls' if CALLS else 'map'}-t{h}.json"), "w") as fh:
             json.dump(data, fh)
         os._exit(0)
     os.waitpid(pid, 0)
@@ -188,5 +237,7 @@ def pytest_unconfigure(config):
         "opens": {k: sorted(v) for k, v in _opens.items()},
         "classes": {k: sorted(v) for k, v in _classes.items()},
     }
-    with open(os.path.join(OUT, f"map-{wid}.json"), "w") as fh:
+    if CALLS:
+        data["collect_missing"] = {k: sorted(v) for k, v in _collect_missing.items()}
+    with open(os.path.join(OUT, f"{'calls' if CALLS else 'map'}-{wid}.json"), "w") as fh:
         json.dump(data, fh)
