@@ -4,6 +4,10 @@ SQLGlot pin: `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. Previous reported
 official score: 196.8. These experiments use the public 30 patches, not the
 hidden workload. The official total includes CPU and is the median of three.
 
+**Current checkpoint: 177.6 s local public median, zero misses. Not a
+submission recommendation.** The faster experiment below used a comparator
+that did not establish complete observations. See the final gate below.
+
 | Public experiment | Simulated s | Local selector CPU s | Missed commits |
 | --- | ---: | ---: | ---: |
 | Original, `d88555e`, profiled | 132.371 | 70.441 | 0 |
@@ -131,3 +135,33 @@ With the previous comparison profile still enabled, the public sample costs
 misses. Compared with the indexed call-only version, those are increases
 of 5.342, 416.132 and 52.783 s. Many archived edits change dispatch-table
 keys during import. This is a correctness trade-off, not a speedup.
+
+## Final gate: keep line coverage for uncertified comparisons
+
+The old mapper records only after an operator returns and treats a skip as
+a successful run. Agreement on recorded values cannot certify all attempts.
+Do not drop tests using those observations. This costs 50.241 simulated
+seconds on two public patches; it costs 0.001 s on the independent set.
+
+| Dataset | Patches | Simulated s | Misses |
+| --- | ---: | ---: | ---: |
+| Public | 30 | 176.631 | 0 |
+| Independent, full | 11 | 157.002 | 0 |
+| Archived, historical labels | 48 | 748.585 | 0 |
+
+Public CPU in three consecutive scorer-limited amd64 runs: 1.371995,
+0.995209 and 0.967995 s. All outputs matched byte-for-byte. The independent
+core-syntax patch also covered all 1,617 failures in the alternate cold
+collection (1,600 failures in the complete suite). No hidden score measured.
+
+Reproduce from workspace root: `docker build --platform linux/amd64 -t
+shrapnel-local:strict entry`, then `bash work/bench.sh shrapnel-local:strict
+entry/sample work/new-public-1`. Repeat with fresh prefixes. The independent
+selector input is `work/validation/data`; pass the sibling `answers.json` to
+the host scorer only. For this run `../work/release.wMfdKe/schedule-diff.tsv`
+contains per-patch counts, worker counts and costs against the frozen arms;
+`worker-diff.jsonl` contains complete before/after assignments.
+
+Next experiment: capture complete, side-effect-free comparison outcomes for
+expensive line visitors on the clean pin, with explicit pass and process
+coverage. Do not reinstate the historical rule to reach a sample target.

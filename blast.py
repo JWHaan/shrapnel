@@ -613,109 +613,12 @@ def _ast_diffs(a: ast.AST, b: ast.AST, out: list | None = None, parent=None, ski
     return out
 
 
-_CMPF = {
-    ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b, ast.Is: lambda a, b: a is b,
-    ast.IsNot: lambda a, b: a is not b, ast.Lt: lambda a, b: a < b, ast.LtE: lambda a, b: a <= b,
-    ast.Gt: lambda a, b: a > b, ast.GtE: lambda a, b: a >= b,
-    ast.In: lambda a, b: a in b, ast.NotIn: lambda a, b: a not in b,
-}
-
-
 def _cmp_refine(fn: str, change, got: set[int], m: Map) -> set[int] | None:
-    """Drop tests whose recorded operands give the same result before and after the change."""
-    if not m.cmp or not fn.startswith("sqlglot/"):
-        return None
-    parent, a, b = change
-    # locate the comparison: either the changed node itself, or a Constant directly inside it
-    if isinstance(a, ast.cmpop) and isinstance(b, ast.cmpop) and isinstance(parent, ast.Compare):
-        if len(parent.ops) != 1:
-            return None
-        cmp_old = parent
-        cmp_new = ast.Compare(left=parent.left, ops=[b], comparators=parent.comparators)
-        side = None
-    elif isinstance(a, ast.Constant) and isinstance(b, ast.Constant) and isinstance(parent, ast.Compare) and len(parent.ops) == 1:
-        cmp_old = parent
-        if parent.left is a:
-            side = 0
-        elif parent.comparators[0] is a:
-            side = 1
-        else:
-            return None
-        cmp_new = None
-    else:
-        return None
-    if cmp_old.lineno in m.collect.get(fn, ()):
-        return None  # cmp_plugin clears its observations after collection
-    site = m.cmp["sites"].get(f"{fn}:{cmp_old.lineno}:{cmp_old.col_offset}")
-    done = set(m.sets[m.cmp["done"]])
-    if m.calls:
-        done.difference_update(m.calls["inspected"].get("<child>", ()))
-    old_op = type(cmp_old.ops[0])
-    f_old = _CMPF.get(old_op)
-    if f_old is None:
-        return None
-    identity = (ast.Is, ast.IsNot)
-    if side is not None and old_op in identity and not (
-        type(a.value) in (bool, type(None)) and type(b.value) in (bool, type(None))
-    ):
-        return None  # repr does not preserve object identity
-    if site is None:
-        # A rich comparison can raise before the tracing helper records it.
-        return got - done if old_op in (ast.Is, ast.IsNot) else None
-    observed = set(m.sets[site[0]])
-    disagree = set(m.sets[site[1]])
-    overflow = set(m.sets[site[2]])
-    pair_of: dict[int, list] = {}
-    for prs, sidx in site[3]:
-        for t in m.sets[sidx]:
-            pair_of[t] = prs
-    keep: set[int] = set()
-    if cmp_new is not None:
-        new_op = type(cmp_new.ops[0])
-        f_new = _CMPF.get(new_op)
-        if f_new is None:
-            return None
-        swap = {frozenset((ast.Eq, ast.Is)), frozenset((ast.NotEq, ast.IsNot))}
-        if (old_op in identity or new_op in identity) and frozenset((old_op, new_op)) not in swap:
-            return None
-        for t in got:
-            if t not in done:
-                keep.add(t)
-            elif t not in observed:
-                if old_op not in (ast.Is, ast.IsNot):
-                    keep.add(t)
-            elif frozenset((old_op, new_op)) in swap:
-                if t in disagree or ast.NotEq in (old_op, new_op) and t in overflow:
-                    keep.add(t)
-            elif t in overflow or t not in pair_of or not _same(pair_of[t], f_old, f_new, None, None):
-                keep.add(t)
-        return keep
-    new_val = b.value
-    for t in got:
-        if t not in done:
-            keep.add(t)
-        elif t not in observed:
-            if old_op not in (ast.Is, ast.IsNot):
-                keep.add(t)
-        elif t in overflow or t not in pair_of or not _same(pair_of[t], f_old, f_old, side, new_val):
-            keep.add(t)
-    return keep
-
-
-def _same(prs, f_old, f_new, side, new_val) -> bool:
-    try:
-        for ra, rb in prs:
-            x, y = ast.literal_eval(ra), ast.literal_eval(rb)
-            x2, y2 = x, y
-            if side == 0:
-                x2 = new_val
-            elif side == 1:
-                y2 = new_val
-            if bool(f_old(x, y)) != bool(f_new(x2, y2)):
-                return False
-        return True
-    except Exception:
-        return False
+    """Keep line candidates: the shipped profile cannot certify a complete run."""
+    # cmp_plugin records only after the operator returns; a caught exception
+    # can leave an apparently complete primitive pair list. Even for `is`, its
+    # "ok" flag doesn't distinguish a passed call from a skip after setup.
+    return None
 
 
 def _find_class(tree, qual):

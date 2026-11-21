@@ -13,10 +13,9 @@ uses the Python standard library and does not execute or import patched code.
    - which sqlglot classes each test uses (the MRO of every `self`/`cls` a method runs with);
    - which data files each test opens; which lines read each class attribute;
    - each test's CPU cost when run in-process;
-   - comparison operands (`tools/cmp_plugin.py`): every single-operator comparison in sqlglot is
-     rewritten to record, per test, whether `is` and `==` agreed and up to 24 primitive operand
-     pairs. When a patch's only change is one comparison (operator swap or compared constant),
-     tests whose recorded operands give the same result before and after are dropped.
+   - historical comparison operands (`tools/cmp_plugin.py`), retained for offline
+     experiments only. The selector keeps line candidates: this profile does not
+     certify caught exceptions, skips or the effects of overloaded equality.
 2. **For each patch** (`blast.py`): apply it in pure Python, compare ASTs (comment-only edits
    drop out), map each changed statement to the tests that run it. Class-body edits go to the
    tests that use that class *and* run a line reading that attribute, falling back to every user
