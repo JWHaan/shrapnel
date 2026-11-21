@@ -675,6 +675,83 @@ class PatchError(Exception):
     pass
 
 
+def modified_files(text: str, root: Path):
+    """Apply ordinary text edits at their stated coordinates. Never guess on a mismatch."""
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    edits = []
+    seen = set()
+    i = 0
+    while i < len(lines):
+        header = re.fullmatch(r"diff --git a/([^\s\\]+) b/\1", lines[i])
+        if not header:
+            raise PatchError("expected a same-path git diff")
+        fn = header[1]
+        if fn in seen or any(part in {"", ".", ".."} for part in fn.split("/")):
+            raise PatchError("non-canonical or repeated path")
+        seen.add(fn)
+        i += 1
+        if i < len(lines) and lines[i].startswith("index "):
+            i += 1
+        if lines[i:i + 2] != [f"--- a/{fn}", f"+++ b/{fn}"]:
+            raise PatchError("expected a text modification")
+        i += 2
+        path = root / fn
+        if not path.resolve().is_relative_to(root.resolve()):
+            raise PatchError("path outside checkout")
+        before = path.read_bytes().decode("utf-8")
+        if "\r" in before or not before.endswith("\n"):
+            raise PatchError("unsupported source line endings")
+        source = before[:-1].split("\n")
+        output = []
+        cursor = 0
+        fd = FileDiff(fn, fn)
+        while i < len(lines) and lines[i].startswith("@@"):
+            h = HUNK.match(lines[i])
+            if h is None:
+                raise PatchError("invalid hunk")
+            old_count, new_count = (int(h[k] or 1) for k in (2, 4))
+            pos = int(h[1]) - bool(old_count)
+            if not cursor <= pos <= len(source):
+                raise PatchError("overlapping or out-of-range hunk")
+            output.extend(source[cursor:pos])
+            if len(output) != int(h[3]) - bool(new_count):
+                raise PatchError("new hunk offset does not match")
+            cursor = pos
+            i += 1
+            removed_block = False
+            while old_count or new_count:
+                if i >= len(lines) or not lines[i] or lines[i][0] not in " +-":
+                    raise PatchError("truncated hunk")
+                tag, body = lines[i][0], lines[i][1:]
+                if tag != "+":
+                    if not old_count or cursor >= len(source) or source[cursor] != body:
+                        raise PatchError("hunk differs from pinned source")
+                    cursor += 1
+                    old_count -= 1
+                if tag != "-":
+                    if not new_count:
+                        raise PatchError("wrong hunk length")
+                    output.append(body)
+                    new_count -= 1
+                if tag == "-":
+                    fd.removed.append(cursor)
+                    removed_block = True
+                elif tag == "+" and not removed_block:
+                    fd.inserts.append(cursor)
+                elif tag == " ":
+                    removed_block = False
+                i += 1
+        if not fd.removed and not fd.inserts:
+            raise PatchError("no changes in diff section")
+        output.extend(source[cursor:])
+        edits.append((fd, before, "\n".join(output) + ("\n" if output else "")))
+    if not edits:
+        raise PatchError("empty patch")
+    return edits
+
+
 def apply_patch(patch_text: str, root: Path) -> dict[str, str | None]:
     """Return {path: new text or None if deleted} for every file the patch touches."""
     out: dict[str, str | None] = {}
