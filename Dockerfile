@@ -6,7 +6,7 @@ ARG SQLGLOT_SHA=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
 RUN python -c "import io,tarfile,urllib.request; d=urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/${SQLGLOT_SHA}.tar.gz').read(); tarfile.open(fileobj=io.BytesIO(d)).extractall('/opt', filter='data')" \
  && mv /opt/sqlglot-${SQLGLOT_SHA} /opt/sqlglot \
  && chmod -R a+rX /opt/sqlglot
-COPY blast.py selector.py /app/
+COPY blast.py selector.py static_map.py /app/
 COPY maps/map.json.gz maps/calls.json.gz /app/maps/
-RUN python -m compileall -q /app && chmod -R a+rX /app
+RUN python /app/static_map.py && python -m compileall -q /app && chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]

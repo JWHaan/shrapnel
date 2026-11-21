@@ -138,7 +138,12 @@ def main() -> None:
     numbers = {t["id"]: t["number"] for t in tests}
     all_tests = final_pack(list(secs), secs, fill_slack=False)
     try:
-        m = blast.Map(APP / "maps" / "map.json.gz")
+        path = APP / "maps" / "static.db"
+        if path.is_file():
+            from static_map import StaticMap
+            m = StaticMap(path)
+        else:
+            m = blast.Map(path.with_name("map.json.gz"))
         remap = {i: numbers[tid] for i, tid in enumerate(m.ids) if tid in numbers}
         unknown = set(secs) - set(remap.values())
     except Exception as exc:

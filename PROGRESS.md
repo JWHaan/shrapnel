@@ -102,3 +102,18 @@ Fresh gate: use `tools/validation_mutants.py`, `tools/validation_run.py` and
 pristine control must account for the manifest. A lab timeout does not become
 a label. Compare the exact candidate schedules with verified labels only;
 do not submit on a partial export or infer hidden-set performance.
+
+## Indexed evidence
+
+Docker now builds a read-only SQLite index from the same two pinned maps.
+The source checkout still works directly with gzip. Indexing alone preserved
+every worker assignment for 30 public, 48 archived and 11 held-out patches.
+The full held-out export is now verified: the call-only and indexed versions
+both score 104.218 simulated seconds with no misses. Two interleaved
+three-run CPU comparisons on the public batch gave median changes of
+1.961 to 1.716 s and 2.915 to 1.927 s. These are local amd64 containers, not
+the hidden scorer. The earlier 6.959 s median is not a paired control.
+
+Reproduce the representation check with
+`python3.13 -m unittest discover -s tools -p test_static_map.py`.
+The local benchmark receipts are in `../work/lazy-map/results/`.
