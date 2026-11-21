@@ -302,17 +302,6 @@ def main() -> None:
     CPU = {t["number"]: max(float(t["seconds"]), cpu_by_id.get(t["id"], float(t["seconds"]) * 1.5)) for t in tests}
     id_of = {t["number"]: t["id"] for t in tests}
 
-    # warm imports the children share
-    try:
-        import pytest  # noqa: F401
-        import _pytest.unittest  # noqa: F401
-        import duckdb  # noqa: F401
-        import numpy  # noqa: F401
-        import pandas  # noqa: F401
-        import pandas.testing  # noqa: F401
-    except Exception as e:  # noqa: BLE001
-        log("warm import failed", e)
-
     patches = sorted((DATA / "commits").glob("*.patch"))
     answers: dict[str, list[list[int]]] = {}
     jobs: list[Job] = []
@@ -367,6 +356,18 @@ def main() -> None:
         if tsk:
             log(cid, "task-restricted:", {k.split("::")[-1]: len(v) for k, v in tsk.items()})
         jobs.append(Job(cid, [id_of[n] for n in run], odir, limits, sum(secs[n] for n in run), tsk))
+
+    # warm imports the children share (only when something will run)
+    if jobs:
+        try:
+            import pytest  # noqa: F401
+            import _pytest.unittest  # noqa: F401
+            import duckdb  # noqa: F401
+            import numpy  # noqa: F401
+            import pandas  # noqa: F401
+            import pandas.testing  # noqa: F401
+        except Exception as e:  # noqa: BLE001
+            log("warm import failed", e)
 
     # run the verification jobs, JOBS at a time
     pending = list(jobs)
