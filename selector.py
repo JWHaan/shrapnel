@@ -42,13 +42,8 @@ def log(*a):
 # ---------------------------------------------------------------- packing
 
 
-def pack(nums: list[int], secs: dict[int, float]) -> tuple[float, list[list[int]]]:
-    """Best split over 1..8 workers (longest first onto lightest)."""
-    if not nums:
-        return 0.0, []
-    ms = {n: round(secs.get(n, 0.0) * 1000) for n in nums}
+def _lpt_options(nums, ms):
     order = sorted(nums, key=lambda n: -ms[n])
-    best = None
     for k in range(1, min(MAX_WORKERS, len(nums)) + 1):
         loads = [0] * k
         ws: list[list[int]] = [[] for _ in range(k)]
@@ -56,9 +51,114 @@ def pack(nums: list[int], secs: dict[int, float]) -> tuple[float, list[list[int]
             j = loads.index(min(loads))
             loads[j] += ms[n]
             ws[j].append(n)
-        cost = max(loads) / 1000 + WORKER_COST * k
-        if best is None or cost < best[0]:
-            best = (cost, [w for w in ws if w])
+        yield max(loads), ws
+
+
+def pack(nums: list[int], secs: dict[int, float]) -> tuple[float, list[list[int]]]:
+    """Cheap LPT cost estimate for choose; use the scorer's integer milliseconds."""
+    ms = {n: int(secs[n] * 1000 + 0.5) for n in nums}
+    return min(((peak / 1000 + WORKER_COST * len(ws), ws) for peak, ws in _lpt_options(nums, ms)),
+               key=lambda result: result[0], default=(0.0, []))
+
+
+def _balance(ws, ms, lower):
+    from bisect import bisect_left
+
+    loads = [sum(ms[n] for n in w) for w in ws]
+    if max(loads) == lower:
+        return ws
+    if len(ws) == 2:
+        both = ws[0] + ws[1]
+        half = sum(loads) // 2
+        # One bit per reachable sum; store prefixes to reconstruct the best partition.
+        if (half + 1) * len(both) <= 16_000_000:
+            mask = (1 << (half + 1)) - 1
+            reachable = 1
+            history = []
+            for n in both:
+                history.append((n, reachable))
+                reachable |= (reachable << ms[n]) & mask
+                if reachable.bit_length() > half:
+                    break
+            target = reachable.bit_length() - 1
+            chosen = set()
+            for n, before in reversed(history):
+                if not (before >> target) & 1:
+                    chosen.add(n)
+                    target -= ms[n]
+            return [[n for n in both if n in chosen], [n for n in both if n not in chosen]]
+
+    # A move (swap with a virtual zero) or swap reduces imbalance by transferring
+    # an amount nearest half the gap. This also makes progress on tied peak loads.
+    for _ in range(12):
+        i = loads.index(max(loads))
+        if loads[i] == lower:
+            break
+        gain = 0
+        for j, worker in enumerate(ws):
+            gap = loads[i] - loads[j]
+            if gap < 2:
+                continue
+            right = sorted(worker, key=ms.__getitem__)
+            weights = [0] + [ms[n] for n in right]
+            for a in ws[i]:
+                pos = bisect_left(weights, ms[a] - gap // 2)
+                for p in (pos - 1, pos):
+                    if 0 <= p < len(weights):
+                        d = ms[a] - weights[p]
+                        if d * (gap - d) > gain:
+                            gain = d * (gap - d)
+                            move = j, a, right[p - 1] if p else None, d
+        if not gain:
+            break
+        j, a, b, d = move
+        ws[i].remove(a)
+        ws[j].append(a)
+        if b is not None:
+            ws[j].remove(b)
+            ws[i].append(b)
+        loads[i] -= d
+        loads[j] += d
+    return ws
+
+
+def final_pack(nums: list[int], secs: dict[int, float], *, fill_slack: bool = True) -> list[list[int]]:
+    """Preserve every selection; improve LPT without increasing its worker count."""
+    if not nums:
+        return []
+    ms = {n: int(secs[n] * 1000 + 0.5) for n in (secs if fill_slack else nums)}
+    fee = int(1000 * WORKER_COST)
+    options = [(peak + fee * len(ws), ws) for peak, ws in _lpt_options(nums, ms)]
+    cost, best = min(options, key=lambda result: result[0])
+    baseline_peak = cost - fee * len(best)
+    total = sum(ms[n] for n in nums)
+    longest = max(ms[n] for n in nums)
+    for _, ws in options:
+        k = len(ws)
+        if k > len(best):
+            break
+        lower = max(longest, (total + k - 1) // k)
+        overhead = fee * k
+        if (lower + overhead, k) >= (cost, len(best)):
+            continue
+        ws = _balance(ws, ms, lower)
+        new_cost = max(sum(ms[n] for n in w) for w in ws) + overhead
+        if new_cost - overhead <= baseline_peak and (new_cost, k) < (cost, len(best)):
+            cost, best = new_cost, ws
+
+    if fill_slack:
+        loads = [sum(ms[n] for n in w) for w in best]
+        room = [max(loads) - load for load in loads]
+        required = set(nums)
+        if not any(room):
+            best[0].extend(n for n in secs if ms[n] == 0 and n not in required)
+            return best
+        for n in sorted((n for n in secs if n not in required), key=ms.__getitem__):
+            j = min((i for i, r in enumerate(room) if r >= ms[n]), key=room.__getitem__, default=None)
+            if j is None:
+                break
+            best[j].append(n)
+            room[j] -= ms[n]
     return best
 
 
@@ -321,13 +421,13 @@ def main() -> None:
             log(cid, "candidates", len(cand), round(sum(secs[n] for n in cand), 2), "|", "; ".join(imp.notes[:4]))
         except Exception as e:  # noqa: BLE001
             log(cid, "fallback to all tests:", repr(e))
-            answers[cid] = pack(all_nums, secs)[1]
+            answers[cid] = final_pack(all_nums, secs)
             continue
         if not cand:
             answers[cid] = []
             continue
         if imp.syntax_error:
-            answers[cid] = pack(cand, secs)[1]
+            answers[cid] = final_pack(cand, secs)
             continue
         code_tests = set(cand) - {remap[t] for t in imp.data_tests if t in remap}
         p_fail = 0.5 if code_tests else 0.9
@@ -348,7 +448,7 @@ def main() -> None:
         include, run = choose(cand, secs, p_fail, est)
         log(cid, f"include {len(include)} ({sum(secs[n] for n in include):.2f}s) run {len(run)} ({sum(secs[n] for n in run):.2f}s)")
         if not run:
-            answers[cid] = pack(include, secs)[1]
+            answers[cid] = final_pack(include, secs)
             continue
         plans[cid] = (include, run)
         limits = {id_of[n]: max(3.0, 8 * secs[n] + 2.0) for n in run}
@@ -415,10 +515,10 @@ def main() -> None:
             sel |= {n for n in run if id_of[n] not in j.results}
         failed = [n for n in run if j.results.get(id_of[n]) is False]
         log(j.cid, "ran", len(j.results), "failed", len(failed), f"budget {j.budget:.2f} cpu {getattr(j, 'cpu', -1):.2f} wall {getattr(j, 'wall', -1):.2f}")
-        answers[j.cid] = pack(sorted(sel), secs)[1]
+        answers[j.cid] = final_pack(sorted(sel), secs)
 
     for p in patches:
-        OUT.write(json.dumps({"commit": p.stem, "workers": answers.get(p.stem, pack(all_nums, secs)[1])}) + "\n")
+        OUT.write(json.dumps({"commit": p.stem, "workers": answers[p.stem]}) + "\n")
     OUT.flush()
     import resource
 
