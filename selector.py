@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from bisect import bisect_left
@@ -135,6 +136,50 @@ def final_pack(nums: list[int], secs: dict[int, float], *, fill_slack: bool = Tr
     return best
 
 
+_IMPORT_RE = re.compile(r"(?:from|import)\s+([A-Za-z_][\w.]*)")
+
+
+def _syntax_bound(m, fd, root):
+    """Tests provably lost when `fd`'s patched content fails to compile.
+
+    Only safe for a leaf test module: it defines tests (in_file evidence) and
+    no other file imports it, so pytest's per-file collection isolation means
+    only its own tests can fail. Coverage attribution is order-dependent
+    (sys.modules caching), so any module importable by another file — or any
+    non-test file — falls back to the full suite.
+    """
+    fn = fd.old
+    if fd.new != fn or not fn.endswith(".py"):
+        return None
+    if not m.in_file(fn):
+        return None
+    name = Path(fn).stem
+    if name in {"conftest", "__init__"}:
+        return None
+    for py in root.rglob("*.py"):
+        if any(part.startswith(".") for part in py.parts):
+            continue
+        try:
+            rel = py.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if rel == fn:
+            continue
+        try:
+            text = py.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            for hit in _IMPORT_RE.finditer(line):
+                if name in hit.group(1).split("."):
+                    return None
+            if (
+                "import_module" in line or "__import__" in line
+            ) and ("tests" in line or name in line):
+                return None
+    return m.in_file(fn) | m.touch(fn) | set(m.collect.get(fn, ()))
+
+
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_bytes())["tests"]
     secs = {t["number"]: t["seconds"] for t in tests}
@@ -192,6 +237,11 @@ def main() -> None:
                     if keep is None and len(edits) == 1:
                         fd, before, after = edits[0]
                         keep = mapping_impact.value_only_tests(fd.old, before, after, m)
+                        if keep is None:
+                            try:
+                                compile(after, fd.old or "", "exec", dont_inherit=True)
+                            except SyntaxError:
+                                keep = _syntax_bound(m, fd, ROOT)
                     if keep is not None:
                         selected = {remap[t] for t in keep if t in remap}
                         workers = final_pack(sorted(selected | unknown), secs)

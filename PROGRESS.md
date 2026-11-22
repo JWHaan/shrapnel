@@ -242,3 +242,40 @@ pguard` from a detached worktree with the two guard commits'
 `blast.py` hunks reverse-applied, then `bash work/bench.sh
 shrapnel-local:pguard entry/sample work/pguard-sample`. Receipts in
 `work/pguard-*.jsonl`.
+
+## Syntax-error bounds: leaf test modules only
+
+Hypothesis: a patch that leaves `after` uncompilable is a collection
+failure, so a bound derived from the map should beat the full-suite
+fallback (~36.8 s).
+
+First attempt (`touch ∪ collect ∪ in_file` for any edited `.py`) was
+refuted by held-out commit `9660fea0eeb1` (`sqlglot/trie.py` missing
+colon): 40 of 1600 failing tests missed. Cause: coverage attribution is
+sys.modules-cache-order dependent — `collect(fn)`/`touch(fn)` name only
+the first file to trigger an import, so files that imported the broken
+module via cache hits record nothing. For non-test files no evidence
+bound is sound; they fall back to the full suite.
+
+For test files the bound survives, but `in_file(fn)` non-empty alone is
+insufficient — `tests/dialects/test_dialect.py` defines tests *and* is
+imported by ~30 sibling files. The sound condition: the file defines
+tests and is a **leaf** — no other file imports it, statically or
+dynamically. `_syntax_bound` in `selector.py` scans every `.py` under
+ROOT for import statements referencing the module name, plus
+`import_module`/`__import__` lines touching `tests`. A leaf's failure is
+confined to its own tests by pytest's per-file collection isolation; any
+exception in the scan leaves the full suite in place.
+
+| Dataset | Patches | Pre-guard s | Leaf-bound s | Misses |
+| --- | ---: | ---: | ---: | ---: |
+| Public | 30 | 121.048 | 121.048 | 0 |
+| Independent, full | 11 | 104.218 | 69.422 | 0 |
+| Archived, historical labels | 48 | 332.453 | 332.453 | 0 |
+
+`2d902c9f7c3e` (broken `tests/test_dialect_imports.py`) narrows to ~102
+tests; `9660fea0eeb1` correctly returns to the full suite.
+
+Reproduce: `docker build --platform linux/amd64 -t shrapnel-local:synkeep
+.`, then `bash work/bench.sh shrapnel-local:synkeep entry/sample
+work/syn-public` and the manual validation run in `work/syn-valid.jsonl`.
