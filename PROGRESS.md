@@ -279,3 +279,38 @@ tests; `9660fea0eeb1` correctly returns to the full suite.
 Reproduce: `docker build --platform linux/amd64 -t shrapnel-local:synkeep
 .`, then `bash work/bench.sh shrapnel-local:synkeep entry/sample
 work/syn-public` and the manual validation run in `work/syn-valid.jsonl`.
+
+## Restore d88555e verification scorer + leaf-only syntax guard
+
+Hypothesis: the official score gap (`d88555e` = 196.8 s vs static
+`121176e` = 313.6 s) comes from the verification architecture — forking
+pytest jobs on an overlay tree keeps only tests that empirically fail,
+which beats static evidence on patches where coarse coverage selects
+broadly but few tests actually break.
+
+Mechanism: restored `selector.py`, `blast.py`, `Dockerfile`,
+`requirements.lock`, and `maps/` from `d88555e` verbatim; removed the
+static-architecture modules and maps. One change on top: the
+`imp.syntax_error` branch previously packed the coverage candidate set
+blindly, which under-counts on the same sys.modules attribution hole as
+the earlier union bound — 40 of 1600 tests missed on `9660fea0eeb1`
+(broken `sqlglot/trie.py`) in local validation. `_syntax_leaf` now keeps
+the candidate set only when the broken file is a proven leaf test module
+(defines tests, nothing else imports it); every other syntax error takes
+the full suite, which is strictly safer than `d88555e` and identical on
+all non-syntax patches.
+
+| Dataset | Patches | Static 121176e | Restore + leaf | Misses |
+| --- | ---: | ---: | ---: | ---: |
+| Public | 30 | 121.048 | 129.926 | 0 |
+| Independent, full | 11 | 69.422 | 69.402 | 0 |
+| Archived, historical labels | 48 | 332.453 | 332.646 | 0 |
+
+The restore alone missed `9660fea0eeb1` (300 s penalty); the leaf guard
+fixes it. Locally the architectures are within noise; the decision rests
+on the official evidence that this architecture already scored 196.8 s
+with zero misses.
+
+Reproduce: `docker build --platform linux/amd64 -t shrapnel-local:verify2
+.`, then `bash work/bench.sh shrapnel-local:verify2 entry/sample
+work/verify2-pub` and the manual runs for `mutset`/`validation`.
