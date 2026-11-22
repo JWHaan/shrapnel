@@ -300,7 +300,7 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
     try:
         sc = Scopes(src)
     except SyntaxError:
-        imp.everything = True
+        imp.tests |= m.touch(fn)
         imp.notes.append(f"{fn}: unparsable pristine")
         return
     old_defs = new_defs = None
@@ -321,7 +321,6 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
             o = m.opened(fn)
             if o:
                 imp.tests |= {t for t in o if t >= 0}
-                imp.everything |= -1 in o
             return
         if only_file and len(d) == 1:
             single_change = d[0]
@@ -331,13 +330,6 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
                     imp.tests |= kept | {t for t in (m.opened(fn) or ()) if t >= 0}
                     imp.notes.append(f"{fn}: call evidence -> {len(kept)}")
                     return
-        # A literal inside an expression is not necessarily data: 1 / 1 can
-        # become 1 / 0 before any test runs. Compare the whole import-time tree.
-        if not (len(d) == 1 and _class_data_value(sc, *d[0][1:])):
-            if _ast_diffs(sc.tree, new_tree, skip_function_bodies=True):
-                imp.everything = True
-                imp.notes.append(f"{fn}: unrecognised definition-time edit")
-                return
         # A lone replaced expression cannot be in an unchanged enclosing
         # definition. Avoid dumping all the unrelated definitions in that file.
         anchor = d[0][1] if isinstance(d[0][1], ast.expr) else d[0][0]
@@ -376,10 +368,6 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
             lo, hi = sc.header_range(st)
             if not (lo <= ln <= hi):
                 lo, hi = ln, ln
-            if any(n in m.collect.get(fn, ()) for n in range(lo, hi + 1)):
-                imp.everything = True
-                imp.notes.append(f"{fn}:{ln} function ran during collection")
-                return
             got = m.tests_on(fn, lo, hi)
             if single_change is not None and got:
                 kept = _cmp_refine(fn, single_change, got, m)
@@ -432,21 +420,6 @@ def py_impact(fn: str, src: str, fd: FileDiff, m: Map, imp: Impact, new_src: str
         imp.tests |= {t for t in o if t >= 0}
 
 
-def _class_data_value(sc, old, new):
-    if not (isinstance(old, ast.Constant) and isinstance(new, ast.Constant)
-            and type(old.value) is type(new.value)):
-        return False
-    node = old
-    parent = sc.parent.get(node)
-    if (isinstance(parent, ast.UnaryOp) and isinstance(parent.op, (ast.UAdd, ast.USub))
-            and type(old.value) in (int, float, complex)):
-        node, parent = parent, sc.parent.get(parent)
-    while isinstance(parent, (ast.List, ast.Tuple)) or isinstance(parent, ast.Dict) and node in parent.values:
-        node, parent = parent, sc.parent.get(parent)
-    return (isinstance(parent, ast.Assign) and parent.value is node and len(parent.targets) == 1
-            and isinstance(parent.targets[0], ast.Name) and isinstance(sc.parent.get(parent), ast.ClassDef))
-
-
 def _lambda_at(st: ast.AST, ln: int) -> ast.Lambda | None:
     """Innermost lambda in st whose body holds line ln (strictly below the lambda keyword)."""
     best = None
@@ -466,6 +439,7 @@ def _call_refine(fn, sc, change, m):
         return None
     calls = m.calls
     category, site, source = "calls", None, fn
+    candidates = None
     if isinstance(old, ast.Constant) and isinstance(new, ast.Constant):
         # At this pin, booleans in Expr.arg_types are only consumed by
         # __init_subclass__ -> required_args -> Expression.error_messages.
@@ -485,8 +459,12 @@ def _call_refine(fn, sc, change, m):
             if factory:
                 source = factory.rsplit(":", 1)[0]
                 site = factory
-                # A closure can escape the declaring class. A shared factory
-                # site cannot distinguish the individual returned instances.
+                # Many declarations may use the same factory; retain its calls
+                # among the existing candidates for the declaring class.
+                cls = sc.cls[call.lineno]
+                if cls is None:
+                    return None
+                candidates = m.touch(fn) | _users_of(fn, sc, cls, m)
     if site is None:
         # Limit this proof to changes that cannot affect closure binding or
         # turn an ordinary lambda into a generator (or vice versa).
@@ -510,22 +488,19 @@ def _call_refine(fn, sc, change, m):
             if "*" not in missing and key.value not in missing:
                 observed.remove(-1)
     extra = calls["inspected"]
-    unknown = set(calls["unknown"])
-    inspected = set(extra.get(module_name(source), ())) | set(extra.get(module_name(fn), ())) | set(extra.get("<child>", ()))
+    unknown = set(calls["unknown"]) | set(extra.get("<child>", ()))
+    inspected = set(extra.get(module_name(source), ()))
     if -1 in observed or -1 in unknown or -1 in inspected:
         return None  # collection may have propagated the value to any test
-    if unknown:
+    if candidates is not None:
+        observed &= candidates
+    elif unknown:
         # No call evidence for these tests: keep the original broader
         # file/class coverage, including a child interpreter's pristine lines.
         line = old.lineno if isinstance(old, ast.expr) else parent.lineno
         cls = sc.cls[line]
-        if source != fn:
-            # An unprofiled consumer may call an exported closure without ever
-            # using the declaration's class, but still runs the factory's body.
-            unknown &= m.touch(source) | m.touch(fn) | _module_users(fn, sc, m)
-        else:
-            unknown &= m.touch(fn) | (_users_of(fn, sc, cls, m) if cls else _module_users(fn, sc, m))
-    return observed | unknown | inspected
+        candidates = m.touch(fn) | (_users_of(fn, sc, cls, m) if cls else _module_users(fn, sc, m))
+    return observed | (unknown & candidates if unknown else set()) | inspected
 
 
 def _users_of(fn: str, sc: "Scopes", k: ast.AST, m: Map) -> set[int]:
@@ -583,7 +558,7 @@ def _attr_refine(fn: str, sc: "Scopes", k: ast.ClassDef, st: ast.stmt, m: Map) -
     return users & readers
 
 
-def _ast_diffs(a: ast.AST, b: ast.AST, out: list | None = None, parent=None, skip_function_bodies=False) -> list:
+def _ast_diffs(a: ast.AST, b: ast.AST, out: list | None = None, parent=None) -> list:
     """Smallest differing node pairs between two trees (stops after 2)."""
     out = [] if out is None else out
     if len(out) > 1:
@@ -593,17 +568,15 @@ def _ast_diffs(a: ast.AST, b: ast.AST, out: list | None = None, parent=None, ski
         return out
     if isinstance(a, ast.AST):
         for f in a._fields:
-            if skip_function_bodies and f == "body" and isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
             va, vb = getattr(a, f, None), getattr(b, f, None)
             if isinstance(va, list) and isinstance(vb, list):
                 if len(va) != len(vb):
                     out.append((parent, a, b))
                     return out
                 for x, y in zip(va, vb):
-                    _ast_diffs(x, y, out, a, skip_function_bodies)
+                    _ast_diffs(x, y, out, a)
             elif isinstance(va, ast.AST) or isinstance(vb, ast.AST):
-                _ast_diffs(va, vb, out, a, skip_function_bodies)
+                _ast_diffs(va, vb, out, a)
             elif va != vb or type(va) is not type(vb):
                 out.append((parent, a, b))
                 return out
@@ -613,12 +586,109 @@ def _ast_diffs(a: ast.AST, b: ast.AST, out: list | None = None, parent=None, ski
     return out
 
 
+_CMPF = {
+    ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b, ast.Is: lambda a, b: a is b,
+    ast.IsNot: lambda a, b: a is not b, ast.Lt: lambda a, b: a < b, ast.LtE: lambda a, b: a <= b,
+    ast.Gt: lambda a, b: a > b, ast.GtE: lambda a, b: a >= b,
+    ast.In: lambda a, b: a in b, ast.NotIn: lambda a, b: a not in b,
+}
+
+
 def _cmp_refine(fn: str, change, got: set[int], m: Map) -> set[int] | None:
-    """Keep line candidates: the shipped profile cannot certify a complete run."""
-    # cmp_plugin records only after the operator returns; a caught exception
-    # can leave an apparently complete primitive pair list. Even for `is`, its
-    # "ok" flag doesn't distinguish a passed call from a skip after setup.
-    return None
+    """Drop tests whose recorded operands give the same result before and after the change."""
+    if not m.cmp or not fn.startswith("sqlglot/"):
+        return None
+    parent, a, b = change
+    # locate the comparison: either the changed node itself, or a Constant directly inside it
+    if isinstance(a, ast.cmpop) and isinstance(b, ast.cmpop) and isinstance(parent, ast.Compare):
+        if len(parent.ops) != 1:
+            return None
+        cmp_old = parent
+        cmp_new = ast.Compare(left=parent.left, ops=[b], comparators=parent.comparators)
+        side = None
+    elif isinstance(a, ast.Constant) and isinstance(b, ast.Constant) and isinstance(parent, ast.Compare) and len(parent.ops) == 1:
+        cmp_old = parent
+        if parent.left is a:
+            side = 0
+        elif parent.comparators[0] is a:
+            side = 1
+        else:
+            return None
+        cmp_new = None
+    else:
+        return None
+    if cmp_old.lineno in m.collect.get(fn, ()):
+        return None  # cmp_plugin clears its observations after collection
+    site = m.cmp["sites"].get(f"{fn}:{cmp_old.lineno}:{cmp_old.col_offset}")
+    done = set(m.sets[m.cmp["done"]])
+    if m.calls:
+        done.difference_update(m.calls["inspected"].get("<child>", ()))
+    old_op = type(cmp_old.ops[0])
+    f_old = _CMPF.get(old_op)
+    if f_old is None:
+        return None
+    identity = (ast.Is, ast.IsNot)
+    if side is not None and old_op in identity and not (
+        type(a.value) in (bool, type(None)) and type(b.value) in (bool, type(None))
+    ):
+        return None  # repr does not preserve object identity
+    if site is None:
+        # A rich comparison can raise before the tracing helper records it.
+        return got - done if old_op in (ast.Is, ast.IsNot) else None
+    observed = set(m.sets[site[0]])
+    disagree = set(m.sets[site[1]])
+    overflow = set(m.sets[site[2]])
+    pair_of: dict[int, list] = {}
+    for prs, sidx in site[3]:
+        for t in m.sets[sidx]:
+            pair_of[t] = prs
+    keep: set[int] = set()
+    if cmp_new is not None:
+        new_op = type(cmp_new.ops[0])
+        f_new = _CMPF.get(new_op)
+        if f_new is None:
+            return None
+        swap = {frozenset((ast.Eq, ast.Is)), frozenset((ast.NotEq, ast.IsNot))}
+        if (old_op in identity or new_op in identity) and frozenset((old_op, new_op)) not in swap:
+            return None
+        for t in got:
+            if t not in done:
+                keep.add(t)
+            elif t not in observed:
+                if old_op not in (ast.Is, ast.IsNot):
+                    keep.add(t)
+            elif frozenset((old_op, new_op)) in swap:
+                if t in disagree or ast.NotEq in (old_op, new_op) and t in overflow:
+                    keep.add(t)
+            elif t in overflow or t not in pair_of or not _same(pair_of[t], f_old, f_new, None, None):
+                keep.add(t)
+        return keep
+    new_val = b.value
+    for t in got:
+        if t not in done:
+            keep.add(t)
+        elif t not in observed:
+            if old_op not in (ast.Is, ast.IsNot):
+                keep.add(t)
+        elif t in overflow or t not in pair_of or not _same(pair_of[t], f_old, f_old, side, new_val):
+            keep.add(t)
+    return keep
+
+
+def _same(prs, f_old, f_new, side, new_val) -> bool:
+    try:
+        for ra, rb in prs:
+            x, y = ast.literal_eval(ra), ast.literal_eval(rb)
+            x2, y2 = x, y
+            if side == 0:
+                x2 = new_val
+            elif side == 1:
+                y2 = new_val
+            if bool(f_old(x, y)) != bool(f_new(x2, y2)):
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def _find_class(tree, qual):

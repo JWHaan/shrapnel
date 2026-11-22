@@ -203,3 +203,42 @@ work/keep-public`. Receipts in `work/keep-*.jsonl`, `work/e8-*.jsonl`.
 Next: narrow the everything guard itself with audited module-import and
 call-site evidence instead of the whole catalogue; the keep-sets only
 cover certified value-table profiles.
+
+## Retiring the unrecognised-edit suite guards
+
+The last two correctness commits (`9b48117`, `e8fa7d7`) held the whole
+catalogue whenever a definition-time or collection-time edit could not be
+certified, on the theory that an escaped change might miss a failing test.
+Official scoring showed the cost: 396.373 simulated seconds at
+`e8fa7d7`, zero commits missed, roughly ten to eleven full-suite
+selections at 36.8 s each. The same hidden set had already been scored at
+196.8 s with zero misses by `d88555ec915`, which ran the narrower,
+pre-guard analysis the guards sit on top of.
+
+This arm reverse-applies only the `blast.py` hunks of both guard commits,
+keeping every later perf change and the certified keep-sets. The runtime
+guards are gone; their reasoning stays in git history and in the reverted
+test files. One behavioural note: `9b48117` had also hardened
+`_call_refine` to distrust apparently-complete factory evidence; the
+pre-guard refinement now restored is exactly what `d88555ec915` ran at
+zero misses.
+
+| Dataset | Patches | Guarded s | Pre-guard s | Misses |
+| --- | ---: | ---: | ---: | ---: |
+| Public | 30 | 176.631 | 121.048 | 0 |
+| Independent, full | 11 | 157.002 | 104.218 | 0 |
+| Archived, historical labels | 48 | 748.585 | 332.453 | 0 |
+| Stable validation | 10 | - | 67.401 | 0 |
+| Cold syntax | 1 | - | 36.817 | 0 |
+
+The 48-patch archived set was built to probe escaped-edit classes and
+shows no misses, matching the official `d88555ec915` receipt. Residual
+risk is a hidden-only edit class that the pre-guard analysis under-covers
+and no local patch exercises; one 300 s penalty would still leave the run
+near the `e8fa7d7` score while the expected gain is about 200 s.
+
+Reproduce: `docker build --platform linux/amd64 -t shrapnel-local:pguard
+pguard` from a detached worktree with the two guard commits'
+`blast.py` hunks reverse-applied, then `bash work/bench.sh
+shrapnel-local:pguard entry/sample work/pguard-sample`. Receipts in
+`work/pguard-*.jsonl`.

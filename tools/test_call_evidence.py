@@ -62,7 +62,7 @@ class CallEvidence(unittest.TestCase):
         self.m.calls["factories"][f"{self.fn}:2:9"] = "sqlglot/other.py:5"
         self.m.calls["calls"]["sqlglot/other.py:5"] = [3, 9]
         src = 'class Demo:\n f = {1: builder(flag=True)}'
-        self.assertEqual(self.refine(src, "True", "False"), {3, 5, 6, 7, 9})
+        self.assertEqual(self.refine(src, "True", "False"), {3, 5, 6})
         self.assertIsNone(self.refine(src, "{1:", "{2:"))
 
     def test_test_file_comparisons_have_no_cmp_profile(self):
